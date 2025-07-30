@@ -16,7 +16,7 @@
 
 import type * as playwright from 'playwright';
 
-export type ToolCapability = 'core' | 'tabs' | 'pdf' | 'history' | 'wait' | 'files' | 'install' | 'testing';
+export type ToolCapability = 'core' | 'tabs' | 'pdf' | 'history' | 'wait' | 'files' | 'install' | 'testing' | 'video';
 
 export type Config = {
   /**
@@ -91,6 +91,7 @@ export type Config = {
    *   - 'wait': Wait and timing utilities.
    *   - 'files': File upload/download support.
    *   - 'install': Browser installation utilities.
+   *   - 'video': Video recording and processing features.
    */
   capabilities?: ToolCapability[];
 

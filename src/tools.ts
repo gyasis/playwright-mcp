@@ -16,6 +16,7 @@
 
 import common from './tools/common.js';
 import console from './tools/console.js';
+import device from './tools/device.js';
 import dialogs from './tools/dialogs.js';
 import files from './tools/files.js';
 import install from './tools/install.js';
@@ -27,6 +28,7 @@ import snapshot from './tools/snapshot.js';
 import tabs from './tools/tabs.js';
 import screenshot from './tools/screenshot.js';
 import testing from './tools/testing.js';
+import video from './tools/video.js';
 import vision from './tools/vision.js';
 import wait from './tools/wait.js';
 
@@ -35,6 +37,7 @@ import type { Tool } from './tools/tool.js';
 export const snapshotTools: Tool<any>[] = [
   ...common(true),
   ...console,
+  ...device(true),
   ...dialogs(true),
   ...files(true),
   ...install,
@@ -46,12 +49,14 @@ export const snapshotTools: Tool<any>[] = [
   ...snapshot,
   ...tabs(true),
   ...testing,
+  ...video,
   ...wait(true),
 ];
 
 export const visionTools: Tool<any>[] = [
   ...common(false),
   ...console,
+  ...device(false),
   ...dialogs(false),
   ...files(false),
   ...install,
@@ -61,6 +66,7 @@ export const visionTools: Tool<any>[] = [
   ...pdf,
   ...tabs(false),
   ...testing,
+  ...video,
   ...vision,
   ...wait(false),
 ];
