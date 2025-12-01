@@ -17,246 +17,248 @@
 import { z } from 'zod';
 import path from 'path';
 import fs from 'fs';
+import { spawn } from 'child_process';
+import crypto from 'crypto';
+import debug from 'debug';
 
 import { defineTool } from './tool.js';
 import { outputFile } from '../config.js';
+import type { OverlayPosition } from '../config.js';
+import type { RecordingState } from './overlay-template.js';
 
 import type * as playwright from 'playwright';
 
-const videoStartSchema = z.object({
-  size: z.object({
-    width: z.number().min(100).max(3840).optional().describe('Video width in pixels (100-3840)'),
-    height: z.number().min(100).max(2160).optional().describe('Video height in pixels (100-2160)')
-  }).optional().describe('Video dimensions. Defaults to viewport size scaled to fit 800x800'),
-  quality: z.enum(['low', 'medium', 'high']).optional().describe('Video quality preset: low (480p), medium (720p), high (1080p)'),
-  filename: z.string().optional().describe('Custom filename for the video. Defaults to recording-{timestamp}.webm')
-});
+// Video recording constants
+/**
+ * Maximum recording duration in milliseconds (7 minutes)
+ * Prevents runaway recordings that consume disk space
+ */
+const MAX_RECORDING_DURATION_MS = 7 * 60 * 1000; // 7 minutes
 
-const videoStopSchema = z.object({
-  saveAs: z.string().optional().describe('Custom path to save video file. If not provided, uses default location')
-});
+/**
+ * Default FPS for video conversion output.
+ * 15 FPS is sufficient for most automation demos and reduces file size.
+ * Playwright records at its native FPS (~25), conversion adjusts final output.
+ */
+const DEFAULT_FPS = 15;
 
-const videoConfigureSchema = z.object({
-  mode: z.enum(['on', 'off', 'retain-on-failure']).optional().describe('Video recording mode'),
-  size: z.object({
-    width: z.number().min(100).max(3840).optional(),
-    height: z.number().min(100).max(2160).optional()
-  }).optional().describe('Default video dimensions for new recordings'),
-  dir: z.string().optional().describe('Directory to save video files')
-});
+/**
+ * Smooth video FPS for animations.
+ * 30 FPS provides smoother playback for content with animations, transitions,
+ * or rapid visual changes that need to be captured clearly.
+ */
+const SMOOTH_FPS = 30;
+
+/**
+ * Default video resolution for recordings.
+ * 800x600 provides a good balance between quality and file size.
+ */
+const DEFAULT_VIDEO_SIZE = { width: 800, height: 600 };
+
+// Schemas for remaining tools after consolidation
 
 const videoConvertSchema = z.object({
   inputPath: z.string().describe('Path to the source video file'),
   outputPath: z.string().describe('Path for the converted video file'),
   format: z.enum(['mp4', 'webm', 'gif']).describe('Target format for conversion'),
-  quality: z.enum(['low', 'medium', 'high']).optional().describe('Quality preset for conversion')
+  quality: z.enum(['low', 'medium', 'high']).optional().describe('Quality preset for conversion'),
+  fps: z.number().min(1).max(60).optional().describe(`Output frame rate. Default: ${DEFAULT_FPS} fps (efficient for automation demos). Use ${SMOOTH_FPS} fps for content with animations or transitions.`),
+  smooth: z.boolean().optional().describe(`When true, uses ${SMOOTH_FPS} fps for smoother animation playback. When false or omitted, uses ${DEFAULT_FPS} fps for smaller file size. Overrides 'fps' parameter if set.`)
 });
 
+/**
+ * Generate a new unique session ID for recording
+ * Uses crypto.randomUUID() per data-model.md
+ */
+function generateSessionId(): string {
+  return crypto.randomUUID();
+}
+
+/**
+ * Validate state machine transition per data-model.md
+ *
+ * Valid transitions:
+ * - idle → recording (on "record" action)
+ * - recording → stopped (on "stop" or "pause" action)
+ * - recording → recording (on "record" action - auto-stops and restarts)
+ * - stopped → recording (on "resume" action - starts new recording)
+ * - stopped → stopped (on "stop" action - idempotent, no error)
+ *
+ * Invalid transitions (throw error):
+ * - idle → stopped (cannot stop before starting)
+ * - Any transition if overlay not enabled
+ *
+ * @param currentState - Current recording state
+ * @param targetState - Desired next state
+ * @param action - Action triggering the transition
+ * @throws Error if transition is invalid
+ */
+function validateStateTransition(
+  currentState: RecordingState,
+  targetState: RecordingState,
+  action: 'record' | 'pause' | 'resume' | 'stop'
+): void {
+  // Validation Rule: Overlay Required
+  if (!videoRecordingState.overlayEnabled)
+    throw new Error('Overlay must be enabled before recording');
+
+
+  // "record" action now auto-stops existing recording, so allow from any state
+  if (action === 'record') {
+    // Allow from any state - we'll auto-stop if needed
+    return;
+  }
+
+  // "stop" is idempotent - if already stopped, that's OK
+  if (action === 'stop' && currentState === 'stopped') {
+    // Already stopped, this is OK
+    return;
+  }
+
+  // Define valid transitions
+  const validTransitions: Record<RecordingState, RecordingState[]> = {
+    idle: ['recording'],
+    recording: ['stopped', 'recording'], // Allow recording -> recording for auto-restart
+    stopped: ['recording'], // Resume starts new recording
+  };
+
+  // Check if transition is valid
+  if (!validTransitions[currentState].includes(targetState))
+    throw new Error(`Invalid state transition: ${currentState} → ${targetState}`);
+
+
+  if ((action === 'stop' || action === 'pause') && currentState !== 'recording')
+    throw new Error('No active recording to stop/pause');
+
+
+  if (action === 'resume' && currentState !== 'stopped')
+    throw new Error('Can only resume from stopped state');
+
+}
+
 // Global video recording state
-let videoRecordingState: {
+// Extended for overlay recording controls (Feature 001)
+const videoRecordingState: {
+  // Existing fields (from original implementation)
   isRecording: boolean;
   startTime?: Date;
   filename?: string;
   config?: any;
+  videoPath?: string;
+  browserContext?: playwright.BrowserContext;
+
+  // NEW: Overlay recording control fields
+  overlayEnabled: boolean;
+  overlayPosition: OverlayPosition;
+  overlayState: RecordingState;
+  sessionId: string | null;
+  stopTime?: Date;
+
+  // Recording timeout for max duration enforcement
+  recordingTimeout?: ReturnType<typeof setTimeout>;
+  // Context reference for auto-stop
+  contextRef?: any;
 } = {
-  isRecording: false
+  isRecording: false,
+  overlayEnabled: false,
+  overlayPosition: 'top-right',
+  overlayState: 'idle',
+  sessionId: null
 };
 
-const videoStart = defineTool({
-  capability: 'video',
-  schema: {
-    name: 'browser_video_start',
-    title: 'Start video recording',
-    description: 'Start recording browser session interactions. Creates a new browser context with video recording enabled.',
-    inputSchema: videoStartSchema,
-    type: 'destructive',
-  },
+/**
+ * Helper to stop recording and clean up state
+ * Used by both manual stop and auto-timeout stop
+ */
+async function stopRecordingInternal(context: any, reason: string): Promise<string | undefined> {
+  // Clear the timeout if it exists
+  if (videoRecordingState.recordingTimeout) {
+    clearTimeout(videoRecordingState.recordingTimeout);
+    videoRecordingState.recordingTimeout = undefined;
+  }
 
-  handle: async (context, params) => {
-    if (videoRecordingState.isRecording)
-      throw new Error('Video recording is already in progress. Stop the current recording first.');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = params.filename || `recording-${timestamp}.webm`;
-    const videoPath = await outputFile(context.config, filename);
+  let videoPath: string | undefined;
 
-    let size = params.size;
-    if (params.quality && !size) {
-      switch (params.quality) {
-        case 'low':
-          size = { width: 854, height: 480 };
-          break;
-        case 'medium':
-          size = { width: 1280, height: 720 };
-          break;
-        case 'high':
-          size = { width: 1920, height: 1080 };
-          break;
-      }
+  if (videoRecordingState.isRecording) {
+    try {
+      const stopResult = await context.stopVideoRecording();
+      if (stopResult)
+        videoPath = stopResult;
+
+    } catch (error) {
+      // Recording may already be stopped
+      const debugError = debug('pw:mcp:video');
+      debugError(`Stop recording (${reason}) encountered error:`, error);
     }
 
-    const recordVideoOptions: playwright.BrowserContextOptions['recordVideo'] = {
-      dir: path.dirname(videoPath),
-      size: size ? { width: size.width!, height: size.height! } : { width: 800, height: 600 }
-    };
+    const stopTime = new Date();
 
-    videoRecordingState = {
-      isRecording: true,
-      startTime: new Date(),
-      filename: videoPath,
-      config: recordVideoOptions
-    };
+    // Update state
+    videoRecordingState.isRecording = false;
+    videoRecordingState.overlayState = 'stopped';
+    videoRecordingState.stopTime = stopTime;
 
-    const code = [
-      `// Start video recording with options: ${JSON.stringify(recordVideoOptions)}`,
-      `const context = await browser.newContext({`,
-      `  recordVideo: ${JSON.stringify(recordVideoOptions, null, 2)}`,
-      `});`,
-      `const page = await context.newPage();`
-    ];
+    // Update overlay visual state if we have a page
+    try {
+      const currentTab = context.currentTab?.();
+      if (currentTab?.page)
+        await updateOverlayState(currentTab.page, 'stopped');
 
-    return {
-      code,
-      captureSnapshot: false,
-      waitForNetwork: false,
-      resultOverride: {
-        content: [{
-          type: 'text' as const,
-          text: `Video recording started. Recording to: ${videoPath}\nQuality: ${params.quality || 'default'}\nSize: ${size?.width || 'auto'}x${size?.height || 'auto'}`
-        }]
-      }
-    };
+    } catch (error) {
+      // Page may be closed, non-fatal
+    }
   }
-});
 
-const videoStop = defineTool({
-  capability: 'video',
-  schema: {
-    name: 'browser_video_stop',
-    title: 'Stop video recording',
-    description: 'Stop active video recording and save the video file. The video is only available after stopping.',
-    inputSchema: videoStopSchema,
-    type: 'destructive',
-  },
+  return videoPath;
+}
 
-  handle: async (_context, params) => {
-    if (!videoRecordingState.isRecording)
-      throw new Error('No video recording is currently active. Start recording first.');
+/**
+ * Start the recording timeout timer (7-minute max)
+ */
+function startRecordingTimeout(context: any): void {
+  // Clear any existing timeout
+  if (videoRecordingState.recordingTimeout)
+    clearTimeout(videoRecordingState.recordingTimeout);
 
-    const recordingDuration = videoRecordingState.startTime
-      ? Date.now() - videoRecordingState.startTime.getTime()
-      : 0;
 
-    const code = [
-      `// Stop video recording and save file`,
-      `await context.close();`,
-      params.saveAs ? `await video.saveAs('${params.saveAs}');` : `// Video automatically saved to ${videoRecordingState.filename}`
-    ];
+  // Store context reference for auto-stop
+  videoRecordingState.contextRef = context;
 
-    const finalPath = params.saveAs || videoRecordingState.filename;
-    const action = async () => {
-      // In a real implementation, we would close the context here
-      // For now, we'll simulate the video stopping
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Video recording stopped successfully!\nDuration: ${Math.round(recordingDuration / 1000)}s\nSaved to: ${finalPath}`
-        }]
-      };
-    };
+  // Set the timeout
+  videoRecordingState.recordingTimeout = setTimeout(async () => {
+    const debugLog = debug('pw:mcp:video');
+    debugLog('Recording timeout reached (7 minutes). Auto-stopping recording.');
 
-    // Reset recording state
-    videoRecordingState = { isRecording: false };
+    if (videoRecordingState.contextRef)
+      await stopRecordingInternal(videoRecordingState.contextRef, 'max duration reached');
 
-    return {
-      code,
-      action,
-      captureSnapshot: false,
-      waitForNetwork: false
-    };
-  }
-});
+  }, MAX_RECORDING_DURATION_MS);
+}
 
-const videoGetStatus = defineTool({
-  capability: 'video',
-  schema: {
-    name: 'browser_video_get_status',
-    title: 'Check video recording status',
-    description: 'Get current video recording status, duration, and configuration details.',
-    inputSchema: z.object({}),
-    type: 'readOnly',
-  },
-
-  handle: async (_context, _params) => {
-    const status = videoRecordingState.isRecording ? 'recording' : 'stopped';
-    const duration = videoRecordingState.startTime && videoRecordingState.isRecording
-      ? Date.now() - videoRecordingState.startTime.getTime()
-      : 0;
-
-    const statusInfo = {
-      status,
-      isRecording: videoRecordingState.isRecording,
-      duration: Math.round(duration / 1000),
-      filename: videoRecordingState.filename,
-      config: videoRecordingState.config
-    };
-
-    return {
-      code: [`// Video recording status: ${status}`],
-      captureSnapshot: false,
-      waitForNetwork: false,
-      resultOverride: {
-        content: [{
-          type: 'text' as const,
-          text: `Video Recording Status:\n${JSON.stringify(statusInfo, null, 2)}`
-        }]
-      }
-    };
-  }
-});
-
-const videoConfigure = defineTool({
-  capability: 'video',
-  schema: {
-    name: 'browser_video_configure',
-    title: 'Configure video recording settings',
-    description: 'Set default video recording configuration for future recordings.',
-    inputSchema: videoConfigureSchema,
-    type: 'destructive',
-  },
-
-  handle: async (context, params) => {
-    // Store configuration for future use
-    const config = {
-      mode: params.mode || 'on',
-      size: params.size || { width: 800, height: 600 },
-      dir: params.dir || context.config.outputDir
-    };
-
-    const code = [
-      `// Configure video recording defaults`,
-      `const videoConfig = ${JSON.stringify(config, null, 2)};`
-    ];
-
-    return {
-      code,
-      captureSnapshot: false,
-      waitForNetwork: false,
-      resultOverride: {
-        content: [{
-          type: 'text' as const,
-          text: `Video recording configuration updated:\n${JSON.stringify(config, null, 2)}`
-        }]
-      }
-    };
-  }
-});
+// Legacy tools (videoStart, videoStop, videoGetStatus, videoConfigure) removed in consolidation
+// Use browser_video_overlay_enable and browser_video_overlay_control instead
 
 const videoConvert = defineTool({
   capability: 'video',
   schema: {
     name: 'browser_video_convert',
     title: 'Convert video format',
-    description: 'Convert video files between different formats (MP4, WebM, GIF). Requires FFmpeg to be installed.',
+    description: `Convert video files between different formats (MP4, WebM, GIF). Requires FFmpeg to be installed.
+
+**FPS Control:**
+- Default: ${DEFAULT_FPS} fps - Efficient for automation demos and most use cases
+- Smooth: ${SMOOTH_FPS} fps - Better for animations, transitions, and rapid visual changes
+- Custom: 1-60 fps range supported via 'fps' parameter
+
+**Recommended Workflow:**
+1. Record with browser_video_overlay_enable (Playwright captures at native ~25 fps)
+2. Convert with browser_video_convert to optimize FPS and format
+3. Use 'smooth: true' only when recording animations or transitions
+
+**Format Notes:**
+- WebM: Native Playwright format, good quality, may need conversion for some platforms
+- MP4: Universal compatibility, recommended for sharing (Google Gemini, social media)
+- GIF: For short clips only, no audio, larger file sizes`,
     inputSchema: videoConvertSchema,
     type: 'destructive',
   },
@@ -269,37 +271,92 @@ const videoConvert = defineTool({
     const outputPath = params.outputPath;
     const format = params.format;
 
+    // Determine target FPS: smooth overrides fps, otherwise use fps or default
+    const targetFps = params.smooth ? SMOOTH_FPS : (params.fps ?? DEFAULT_FPS);
+
     // FFmpeg command construction
-    let ffmpegOptions = '';
+    const ffmpegOptions: string[] = [];
+
+    // Add FPS filter
+    ffmpegOptions.push('-r', String(targetFps));
+
+    // Add quality settings
     switch (params.quality) {
       case 'low':
-        ffmpegOptions = format === 'mp4' ? '-crf 28' : '-b:v 500k';
+        ffmpegOptions.push(...(format === 'mp4' ? ['-crf', '28'] : ['-b:v', '500k']));
         break;
       case 'medium':
-        ffmpegOptions = format === 'mp4' ? '-crf 23' : '-b:v 1M';
+        ffmpegOptions.push(...(format === 'mp4' ? ['-crf', '23'] : ['-b:v', '1M']));
         break;
       case 'high':
-        ffmpegOptions = format === 'mp4' ? '-crf 18' : '-b:v 2M';
+        ffmpegOptions.push(...(format === 'mp4' ? ['-crf', '18'] : ['-b:v', '2M']));
         break;
       default:
-        ffmpegOptions = format === 'mp4' ? '-crf 23' : '-b:v 1M';
+        ffmpegOptions.push(...(format === 'mp4' ? ['-crf', '23'] : ['-b:v', '1M']));
     }
+
+    const ffmpegArgs = [
+      '-i', params.inputPath,
+      ...ffmpegOptions,
+      '-y',
+      outputPath
+    ];
 
     const code = [
       `// Convert video from ${path.extname(params.inputPath)} to ${format}`,
-      `// Note: This requires FFmpeg to be installed on the system`,
-      `// Command: ffmpeg -i "${params.inputPath}" ${ffmpegOptions} "${outputPath}"`
+      `// FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`,
+      `const ffmpeg = spawn('ffmpeg', ${JSON.stringify(ffmpegArgs)});`
     ];
 
     const action = async () => {
-      // In a real implementation, we would execute FFmpeg here
-      // For now, we'll simulate the conversion
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Video conversion simulated:\nInput: ${params.inputPath}\nOutput: ${outputPath}\nFormat: ${format}\nQuality: ${params.quality || 'medium'}\n\nNote: Actual conversion requires FFmpeg installation and execution.`
-        }]
-      };
+      // Check FFmpeg availability
+      const ffmpegCommand = 'ffmpeg';
+
+      return new Promise<{ content: { type: 'text'; text: string; }[] }>((resolve, reject) => {
+        const ffmpeg = spawn(ffmpegCommand, ffmpegArgs);
+
+        let stderr = '';
+        ffmpeg.stderr.on('data', data => {
+          stderr += data.toString();
+        });
+
+        ffmpeg.on('close', async code => {
+          if (code === 0) {
+            // Success - check output file
+            const outputExists = fs.existsSync(outputPath);
+            if (outputExists) {
+              const stats = await fs.promises.stat(outputPath);
+              resolve({
+                content: [{
+                  type: 'text' as const,
+                  text: [
+                    `Video conversion completed successfully!`,
+                    ``,
+                    `Input: ${params.inputPath}`,
+                    `Output: ${outputPath}`,
+                    `Format: ${format}`,
+                    `Quality: ${params.quality || 'medium'}`,
+                    `FPS: ${targetFps} (${params.smooth ? 'smooth mode' : 'standard'})`,
+                    `Output file size: ${Math.round(stats.size / 1024)}KB`
+                  ].join('\n')
+                }]
+              });
+            } else {
+              reject(new Error(`FFmpeg completed but output file not found: ${outputPath}`));
+            }
+          } else {
+            reject(new Error(`FFmpeg failed with code ${code}. Error: ${stderr}`));
+          }
+        });
+
+        ffmpeg.on('error', error => {
+          if (error.message.includes('ENOENT'))
+            reject(new Error('FFmpeg not found. Please install FFmpeg to use video conversion.'));
+          else
+            reject(new Error(`FFmpeg error: ${error.message}`));
+
+        });
+      });
     };
 
     return {
@@ -316,7 +373,17 @@ const videoSave = defineTool({
   schema: {
     name: 'browser_video_save',
     title: 'Save video recording',
-    description: 'Save current or completed video recording to a specific location with custom naming.',
+    description: `Save current or completed video recording to a specific location with custom naming.
+
+**Usage:**
+1. Record video using browser_video_overlay_enable/control
+2. Stop recording to finalize the video
+3. Call browser_video_save to copy to custom location
+
+**Notes:**
+- Native format is WebM (VP8 codec)
+- Use browser_video_convert for MP4 or to adjust FPS
+- Video specs: ${DEFAULT_VIDEO_SIZE.width}x${DEFAULT_VIDEO_SIZE.height}, ~25 fps`,
     inputSchema: z.object({
       filename: z.string().describe('Filename for the saved video'),
       format: z.enum(['webm', 'mp4']).optional().describe('Video format (webm is native Playwright format)')
@@ -325,25 +392,35 @@ const videoSave = defineTool({
   },
 
   handle: async (context, params) => {
-    if (!videoRecordingState.filename)
+    if (!videoRecordingState.filename && !videoRecordingState.videoPath)
       throw new Error('No video recording available to save. Start and stop a recording first.');
 
     const outputPath = await outputFile(context.config, params.filename);
     const format = params.format || 'webm';
-
-    const code = [
-      `// Save video recording`,
-      `await video.saveAs('${outputPath}');`
-    ];
+    const sourcePath = videoRecordingState.videoPath || videoRecordingState.filename!;
 
     const action = async () => {
+      // Check if source video exists
+      if (!fs.existsSync(sourcePath))
+        throw new Error(`Source video file not found: ${sourcePath}`);
+
+      // Copy the video file to the new location
+      await fs.promises.copyFile(sourcePath, outputPath);
+
+      const stats = await fs.promises.stat(outputPath);
+
       return {
         content: [{
           type: 'text' as const,
-          text: `Video saved successfully!\nLocation: ${outputPath}\nFormat: ${format}`
+          text: `Video saved successfully!\nSource: ${sourcePath}\nDestination: ${outputPath}\nFormat: ${format}\nFile size: ${Math.round(stats.size / 1024)}KB`
         }]
       };
     };
+
+    const code = [
+      `// Save video recording from ${sourcePath}`,
+      `await fs.promises.copyFile('${sourcePath}', '${outputPath}');`
+    ];
 
     return {
       code,
@@ -354,128 +431,175 @@ const videoSave = defineTool({
   }
 });
 
-const videoAddAnnotation = defineTool({
-  capability: 'video',
-  schema: {
-    name: 'browser_video_add_annotation',
-    title: 'Add annotation to video',
-    description: 'Add text annotations, highlights, or markers to video recording during playback.',
-    inputSchema: z.object({
-      text: z.string().describe('Annotation text to display'),
-      timestamp: z.number().optional().describe('Timestamp in seconds when annotation should appear (current time if not specified)'),
-      duration: z.number().optional().describe('How long annotation should be visible in seconds (default: 3)'),
-      position: z.enum(['top-left', 'top-right', 'bottom-left', 'bottom-right', 'center']).optional().describe('Position of annotation on screen'),
-      style: z.object({
-        fontSize: z.number().optional().describe('Font size in pixels'),
-        color: z.string().optional().describe('Text color (CSS color value)'),
-        backgroundColor: z.string().optional().describe('Background color (CSS color value)')
-      }).optional().describe('Styling options for the annotation')
-    }),
-    type: 'destructive',
-  },
+// Placeholder effect tools (videoAddAnnotation, videoAddHighlight, videoAddCursorTracking) removed in consolidation
+// These tools only generated FFmpeg commands without actual functionality
 
-  handle: async (_context, params) => {
-    if (!videoRecordingState.isRecording)
-      throw new Error('No active video recording. Start recording first to add annotations.');
+/**
+ * Update overlay visual state in the browser
+ *
+ * This function implements the backend→overlay communication pattern from research.md:
+ * - Uses page.evaluate() for direct DOM manipulation
+ * - Synchronous execution ensures state changes happen immediately
+ * - Updates overlay visual state to match recording state
+ *
+ * @param page - Page with overlay injected
+ * @param state - New recording state
+ * @param elapsedTime - Elapsed recording time in seconds (optional)
+ */
+export async function updateOverlayState(
+  page: playwright.Page,
+  state: RecordingState,
+  elapsedTime?: number
+): Promise<void> {
+  const { generateUpdateStateScript } = await import('./overlay-template.js');
+  const updateScript = generateUpdateStateScript(state, elapsedTime);
 
-    const timestamp = params.timestamp || (videoRecordingState.startTime ?
-      (Date.now() - videoRecordingState.startTime.getTime()) / 1000 : 0);
-    const duration = params.duration || 3;
-    const position = params.position || 'top-right';
-    const style = params.style || {};
-
-    const annotation = {
-      text: params.text,
-      timestamp,
-      duration,
-      position,
-      style: {
-        fontSize: style.fontSize || 16,
-        color: style.color || '#ffffff',
-        backgroundColor: style.backgroundColor || 'rgba(0,0,0,0.7)'
-      }
-    };
-
-    const code = [
-      `// Add annotation to video at ${timestamp}s`,
-      `// Note: This would typically require post-processing with FFmpeg`,
-      `const annotation = ${JSON.stringify(annotation, null, 2)};`,
-      `// FFmpeg command: ffmpeg -i input.webm -vf "drawtext=text='${params.text}':x=10:y=10:fontsize=${style.fontSize || 16}:fontcolor=${style.color || 'white'}:enable='between(t,${timestamp},${timestamp + duration})'" output.webm`
-    ];
-
-    return {
-      code,
-      captureSnapshot: false,
-      waitForNetwork: false,
-      resultOverride: {
-        content: [{
-          type: 'text' as const,
-          text: `Annotation added to video:\nText: "${params.text}"\nTimestamp: ${timestamp}s\nDuration: ${duration}s\nPosition: ${position}\n\nNote: Actual annotation rendering requires post-processing with FFmpeg.`
-        }]
-      }
-    };
+  try {
+    await page.evaluate(updateScript);
+  } catch (error) {
+    // Overlay may not be injected yet or page may be closed - this is non-fatal
+    const debugError = debug('pw:mcp:overlay');
+    debugError('Failed to update overlay state:', error);
   }
+}
+
+// T012: Browser overlay enable tool (User Story 1 - MVP)
+const videoOverlayEnableSchema = z.object({
+  position: z.enum(['top-left', 'top-right', 'bottom-left', 'bottom-right']).optional().describe('Overlay position on browser window. Default \'top-right\' minimizes interference with page content and browser UI.'),
+  autoStart: z.boolean().optional().describe('Automatically start recording when overlay is enabled. If true, recording begins immediately without requiring explicit browser_video_overlay_control call.')
 });
 
-const videoAddHighlight = defineTool({
+const videoOverlayEnable = defineTool({
   capability: 'video',
   schema: {
-    name: 'browser_video_add_highlight',
-    title: 'Add visual highlight to video',
-    description: 'Add visual highlights like arrows, rectangles, or circles to emphasize elements during video recording.',
-    inputSchema: z.object({
-      type: z.enum(['arrow', 'rectangle', 'circle', 'pointer']).describe('Type of highlight to add'),
-      x: z.number().describe('X coordinate of highlight center/start point'),
-      y: z.number().describe('Y coordinate of highlight center/start point'),
-      width: z.number().optional().describe('Width for rectangle highlights'),
-      height: z.number().optional().describe('Height for rectangle highlights'),
-      radius: z.number().optional().describe('Radius for circle highlights'),
-      timestamp: z.number().optional().describe('Timestamp in seconds when highlight should appear'),
-      duration: z.number().optional().describe('How long highlight should be visible (default: 2 seconds)'),
-      color: z.string().optional().describe('Highlight color (CSS color value, default: red)')
-    }),
+    name: 'browser_video_overlay_enable',
+    title: 'Enable recording overlay controls',
+    description: `Enable recording overlay controls for current browser session. Shows record/pause/stop buttons that can be triggered via MCP tools. Overlay persists across page navigations and provides visual feedback of recording state to users and LLMs.
+
+**Recording Specifications:**
+- Format: WebM (VP8 codec) - native Playwright format
+- Resolution: ${DEFAULT_VIDEO_SIZE.width}x${DEFAULT_VIDEO_SIZE.height} pixels
+- FPS: ~25 fps (Playwright native capture rate)
+- Compatible with: Google Gemini, most video platforms
+
+**Workflow:**
+1. Call browser_video_overlay_enable to activate overlay
+2. Use autoStart=true for immediate recording, or control manually
+3. Use browser_video_overlay_control for pause/resume/stop
+4. Check browser_video_status for recording info and video path
+5. Optional: Use browser_video_convert to change format/FPS
+
+**Note:** Use browser_video_convert to adjust FPS (15 fps default, 30 fps for smooth animations) after recording.`,
+    inputSchema: videoOverlayEnableSchema,
     type: 'destructive',
   },
 
-  handle: async (_context, params) => {
-    if (!videoRecordingState.isRecording)
-      throw new Error('No active video recording. Start recording first to add highlights.');
+  handle: async (context, params) => {
+    // T016: Error handling for OVERLAY_ALREADY_ENABLED
+    if (videoRecordingState.overlayEnabled)
+      throw new Error('OVERLAY_ALREADY_ENABLED: Recording overlay is already enabled for this session. Call browser_video_overlay_control to manage existing overlay, or close browser context and create new session.');
 
-    const timestamp = params.timestamp || (videoRecordingState.startTime ?
-      (Date.now() - videoRecordingState.startTime.getTime()) / 1000 : 0);
-    const duration = params.duration || 2;
-    const color = params.color || 'red';
 
-    const highlight = {
-      type: params.type,
-      x: params.x,
-      y: params.y,
-      width: params.width,
-      height: params.height,
-      radius: params.radius,
-      timestamp,
-      duration,
-      color
-    };
+    // T016: Error handling for CONTEXT_CLOSED
+    // Ensure a tab exists (creates browser context if needed)
+    try {
+      await context.ensureTab();
+    } catch (error) {
+      throw new Error('CONTEXT_CLOSED: Browser context is closed, cannot enable overlay. Create new browser context before enabling overlay.');
+    }
 
-    let overlayFilter = '';
-    switch (params.type) {
-      case 'rectangle':
-        overlayFilter = `drawbox=x=${params.x}:y=${params.y}:w=${params.width || 100}:h=${params.height || 100}:color=${color}:t=2`;
-        break;
-      case 'circle':
-        overlayFilter = `drawbox=x=${params.x - (params.radius || 25)}:y=${params.y - (params.radius || 25)}:w=${(params.radius || 25) * 2}:h=${(params.radius || 25) * 2}:color=${color}:t=2`;
-        break;
-      case 'arrow':
-      case 'pointer':
-        overlayFilter = `drawtext=text='→':x=${params.x}:y=${params.y}:fontsize=24:fontcolor=${color}`;
-        break;
+    const position: OverlayPosition = params.position || 'top-right';
+    const autoStart = params.autoStart || false;
+
+    // T007: Generate session ID
+    const sessionId = generateSessionId();
+
+    // T004: Update global state with overlay fields
+    videoRecordingState.overlayEnabled = true;
+    videoRecordingState.overlayPosition = position;
+    videoRecordingState.overlayState = 'idle';
+    videoRecordingState.sessionId = sessionId;
+
+    // T014: Integrate overlay with browser context creation
+    // Inject overlay into all current and future pages
+    const currentTab = context.currentTabOrDie();
+    const browserContext = currentTab.page.context();
+
+    // T005: Inject overlay using Context method (implemented in context.ts)
+    await context.injectRecordingOverlay(currentTab.page, position, sessionId);
+
+    // Set up overlay injection for future pages
+    browserContext.on('page', async page => {
+      await context.injectRecordingOverlay(page, position, sessionId);
+    });
+
+    let recordingStarted = false;
+
+    // T015: Auto-start logic
+    if (autoStart) {
+      // AUTO-STOP: If somehow already recording, stop first
+      if (videoRecordingState.isRecording) {
+        const debugLog = debug('pw:mcp:video');
+        debugLog('Auto-stopping existing recording before autoStart');
+        await stopRecordingInternal(context, 'auto-stop for autoStart');
+        videoRecordingState.overlayState = 'idle';
+      }
+
+      // Start video recording using existing video infrastructure
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `overlay-recording-${timestamp}.webm`;
+      const videoPath = await outputFile(context.config, filename);
+      const videoDir = path.dirname(videoPath);
+
+      // Ensure video directory exists
+      await fs.promises.mkdir(videoDir, { recursive: true });
+
+      const recordVideoOptions: playwright.BrowserContextOptions['recordVideo'] = {
+        dir: videoDir,
+        size: DEFAULT_VIDEO_SIZE
+      };
+
+      // Start video recording (Playwright captures at native ~25 fps)
+      // NOTE: This recreates the browser context, so we need fresh references after
+      await context.startVideoRecording(recordVideoOptions);
+
+      // Get fresh references after browser context recreation
+      const freshTab = context.currentTabOrDie();
+      const freshBrowserContext = freshTab.page.context();
+
+      // Re-inject overlay into the fresh page since context was recreated
+      await context.injectRecordingOverlay(freshTab.page, position, sessionId);
+
+      // Set up overlay injection for future pages on the new context
+      freshBrowserContext.on('page', async page => {
+        await context.injectRecordingOverlay(page, position, sessionId);
+      });
+
+      // Update state to recording
+      videoRecordingState.isRecording = true;
+      videoRecordingState.startTime = new Date();
+      videoRecordingState.filename = filename;
+      videoRecordingState.videoPath = videoPath;
+      videoRecordingState.browserContext = freshBrowserContext;
+      videoRecordingState.overlayState = 'recording';
+
+      // Start 7-minute recording timeout
+      startRecordingTimeout(context);
+
+      // T006: Update overlay visual state using fresh page reference
+      await updateOverlayState(freshTab.page, 'recording');
+
+      recordingStarted = true;
     }
 
     const code = [
-      `// Add ${params.type} highlight at (${params.x}, ${params.y}) at ${timestamp}s`,
-      `const highlight = ${JSON.stringify(highlight, null, 2)};`,
-      `// FFmpeg overlay filter: ${overlayFilter}:enable='between(t,${timestamp},${timestamp + duration})'`
+      `// Enable recording overlay controls`,
+      `const overlayConfig = {`,
+      `  position: '${position}',`,
+      `  sessionId: '${sessionId}',`,
+      `  autoStart: ${autoStart}`,
+      `};`,
+      autoStart ? `// Recording auto-started` : `// Overlay enabled (recording not started)`
     ];
 
     return {
@@ -485,42 +609,381 @@ const videoAddHighlight = defineTool({
       resultOverride: {
         content: [{
           type: 'text' as const,
-          text: `${params.type} highlight added:\nPosition: (${params.x}, ${params.y})\nTimestamp: ${timestamp}s\nDuration: ${duration}s\nColor: ${color}\n\nNote: Actual highlight rendering requires post-processing with FFmpeg.`
+          text: [
+            `Recording overlay enabled successfully:`,
+            ``,
+            `Session ID: ${sessionId}`,
+            `Position: ${position}`,
+            `Recording auto-started: ${recordingStarted}`,
+            ``,
+            recordingStarted
+              ? `Recording is now active. Use browser_video_overlay_control to pause/stop.`
+              : `Overlay ready. Use browser_video_overlay_control to start recording.`
+          ].join('\n')
         }]
       }
     };
   }
 });
 
-const videoAddCursorTracking = defineTool({
+// T022: Browser overlay control tool (User Story 2 - Manual Control)
+const videoOverlayControlSchema = z.object({
+  action: z.enum(['record', 'pause', 'resume', 'stop']).describe('Recording control action to execute. \'record\' starts recording, \'pause\' stops current recording, \'resume\' starts new recording, \'stop\' finalizes and saves video.')
+});
+
+const videoOverlayControl = defineTool({
   capability: 'video',
   schema: {
-    name: 'browser_video_add_cursor_tracking',
-    title: 'Enable enhanced cursor tracking',
-    description: 'Enable enhanced cursor visibility, click animations, and movement trails for better video demonstrations.',
-    inputSchema: z.object({
-      enabled: z.boolean().describe('Enable or disable cursor tracking'),
-      clickAnimation: z.boolean().optional().describe('Show click animations (default: true)'),
-      cursorSize: z.number().optional().describe('Cursor size multiplier (default: 1.5)'),
-      clickColor: z.string().optional().describe('Click animation color (default: yellow)'),
-      trailLength: z.number().optional().describe('Mouse trail length in pixels (0 to disable, default: 0)')
-    }),
+    name: 'browser_video_overlay_control',
+    title: 'Control recording via overlay',
+    description: `Control recording via overlay buttons (record/pause/resume/stop). Triggers recording state changes and updates overlay visual state.
+
+**Actions:**
+- 'record': Start new recording (from idle state)
+- 'pause': Stop current recording and save video (Playwright limitation: true pause not supported)
+- 'resume': Start new recording (creates new video file)
+- 'stop': Finalize recording and save video
+
+**State Machine:**
+- idle → recording (on 'record')
+- recording → stopped (on 'pause' or 'stop')
+- stopped → recording (on 'resume' - new video file)
+
+**Important:** Each pause/resume cycle creates a new video file. Use browser_video_status to get the video path after stopping.`,
+    inputSchema: videoOverlayControlSchema,
     type: 'destructive',
   },
 
-  handle: async (_context, params) => {
-    const settings = {
-      enabled: params.enabled,
-      clickAnimation: params.clickAnimation ?? true,
-      cursorSize: params.cursorSize || 1.5,
-      clickColor: params.clickColor || 'yellow',
-      trailLength: params.trailLength || 0
+  handle: async (context, params) => {
+    const { action } = params;
+
+    // T029: Error handling - OVERLAY_NOT_ENABLED
+    if (!videoRecordingState.overlayEnabled)
+      throw new Error('OVERLAY_NOT_ENABLED: Recording overlay is not enabled. Call browser_video_overlay_enable before attempting to control recording.');
+
+
+    const previousState = videoRecordingState.overlayState;
+    const currentTab = context.currentTabOrDie();
+    let videoPath: string | null = null;
+    let duration: number | null = null;
+    let message = '';
+
+    // T028: Validate state transition BEFORE executing action
+    let targetState: RecordingState;
+    switch (action) {
+      case 'record':
+        targetState = 'recording';
+        break;
+      case 'pause':
+      case 'stop':
+        targetState = 'stopped';
+        break;
+      case 'resume':
+        targetState = 'recording';
+        break;
+    }
+
+    // Use validateStateTransition function from T008
+    try {
+      validateStateTransition(previousState, targetState, action);
+    } catch (error) {
+      // T029: Error handling - INVALID_STATE_TRANSITION, RECORDING_ALREADY_ACTIVE, NO_ACTIVE_RECORDING
+      throw error; // Re-throw with original error message
+    }
+
+    // Execute action handlers
+
+    // T023: Implement "record" action handler
+    if (action === 'record') {
+      // AUTO-STOP: If already recording, stop first before starting new
+      if (videoRecordingState.isRecording) {
+        const debugLog = debug('pw:mcp:video');
+        debugLog('Auto-stopping existing recording before starting new one');
+        await stopRecordingInternal(context, 'auto-stop for new recording');
+        // Reset state to allow new recording
+        videoRecordingState.overlayState = 'idle';
+      }
+
+      // Start video recording using existing infrastructure
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `overlay-recording-${timestamp}.webm`;
+      const videoFilePath = await outputFile(context.config, filename);
+      const videoDir = path.dirname(videoFilePath);
+
+      await fs.promises.mkdir(videoDir, { recursive: true });
+
+      const recordVideoOptions: playwright.BrowserContextOptions['recordVideo'] = {
+        dir: videoDir,
+        size: DEFAULT_VIDEO_SIZE
+      };
+
+      // Start video recording (Playwright captures at native ~25 fps)
+      // NOTE: This recreates the browser context, so we need fresh references after
+      await context.startVideoRecording(recordVideoOptions);
+
+      // Get fresh references after browser context recreation
+      const freshTab = context.currentTabOrDie();
+      const freshBrowserContext = freshTab.page.context();
+
+      // Re-inject overlay into the fresh page since context was recreated
+      const position = videoRecordingState.overlayPosition;
+      const sessionId = videoRecordingState.sessionId!;
+      await context.injectRecordingOverlay(freshTab.page, position, sessionId);
+
+      // Set up overlay injection for future pages on the new context
+      freshBrowserContext.on('page', async page => {
+        await context.injectRecordingOverlay(page, position, sessionId);
+      });
+
+      // Update state
+      videoRecordingState.isRecording = true;
+      videoRecordingState.startTime = new Date();
+      videoRecordingState.filename = filename;
+      videoRecordingState.videoPath = videoFilePath;
+      videoRecordingState.browserContext = freshBrowserContext;
+      videoRecordingState.overlayState = 'recording';
+
+      // Start 7-minute recording timeout
+      startRecordingTimeout(context);
+
+      // T027: Update overlay visual state using fresh page reference
+      await updateOverlayState(freshTab.page, 'recording');
+
+      message = 'Recording started successfully (max duration: 7 minutes)';
+    } else if (action === 'pause') {
+    // T024: Implement "pause" action handler
+    // Per research.md: "pause" stops current recording and saves video
+      // Clear the recording timeout
+      if (videoRecordingState.recordingTimeout) {
+        clearTimeout(videoRecordingState.recordingTimeout);
+        videoRecordingState.recordingTimeout = undefined;
+      }
+
+      // Stop the current recording
+      const stopResult = await context.stopVideoRecording();
+
+      if (stopResult && videoRecordingState.startTime) {
+        videoPath = stopResult;
+        const stopTime = new Date();
+        duration = (stopTime.getTime() - videoRecordingState.startTime.getTime()) / 1000;
+
+        // Update state
+        videoRecordingState.isRecording = false;
+        videoRecordingState.overlayState = 'stopped';
+        videoRecordingState.stopTime = stopTime;
+
+        // T027: Update overlay visual state
+        await updateOverlayState(currentTab.page, 'stopped');
+
+        message = `Recording paused (stopped). Video saved to ${videoPath}. Resume will start new recording.`;
+      } else {
+        throw new Error('Failed to stop recording during pause action');
+      }
+    } else if (action === 'resume') {
+    // T025: Implement "resume" action handler
+    // Per research.md: "resume" starts NEW recording (new video file)
+      // Start NEW recording (same as record action, but from stopped state)
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `overlay-recording-${timestamp}.webm`;
+      const videoFilePath = await outputFile(context.config, filename);
+      const videoDir = path.dirname(videoFilePath);
+
+      await fs.promises.mkdir(videoDir, { recursive: true });
+
+      const recordVideoOptions: playwright.BrowserContextOptions['recordVideo'] = {
+        dir: videoDir,
+        size: DEFAULT_VIDEO_SIZE
+      };
+
+      // Start video recording (Playwright captures at native ~25 fps)
+      // NOTE: This recreates the browser context, so we need fresh references after
+      await context.startVideoRecording(recordVideoOptions);
+
+      // Get fresh references after browser context recreation
+      const freshTab = context.currentTabOrDie();
+      const freshBrowserContext = freshTab.page.context();
+
+      // Re-inject overlay into the fresh page since context was recreated
+      const position = videoRecordingState.overlayPosition;
+      const sessionId = videoRecordingState.sessionId!;
+      await context.injectRecordingOverlay(freshTab.page, position, sessionId);
+
+      // Set up overlay injection for future pages on the new context
+      freshBrowserContext.on('page', async page => {
+        await context.injectRecordingOverlay(page, position, sessionId);
+      });
+
+      // Update state
+      videoRecordingState.isRecording = true;
+      videoRecordingState.startTime = new Date();
+      videoRecordingState.filename = filename;
+      videoRecordingState.videoPath = videoFilePath;
+      videoRecordingState.browserContext = freshBrowserContext;
+      videoRecordingState.overlayState = 'recording';
+      delete videoRecordingState.stopTime;
+
+      // Start 7-minute recording timeout
+      startRecordingTimeout(context);
+
+      // T027: Update overlay visual state using fresh page reference
+      await updateOverlayState(freshTab.page, 'recording');
+
+      message = 'Recording resumed (new recording started, max duration: 7 minutes)';
+    } else if (action === 'stop') {
+    // T026: Implement "stop" action handler
+      // Clear the recording timeout
+      if (videoRecordingState.recordingTimeout) {
+        clearTimeout(videoRecordingState.recordingTimeout);
+        videoRecordingState.recordingTimeout = undefined;
+      }
+
+      // Stop the recording and finalize video
+      const stopResult = await context.stopVideoRecording();
+
+      if (stopResult && videoRecordingState.startTime) {
+        videoPath = stopResult;
+        const stopTime = new Date();
+        duration = (stopTime.getTime() - videoRecordingState.startTime.getTime()) / 1000;
+
+        // Update state
+        videoRecordingState.isRecording = false;
+        videoRecordingState.overlayState = 'stopped';
+        videoRecordingState.stopTime = stopTime;
+
+        // T027: Update overlay visual state
+        await updateOverlayState(currentTab.page, 'stopped');
+
+        message = `Recording stopped. Video saved to ${videoPath}`;
+      } else {
+        // Recording may already be stopped (e.g., by timeout)
+        // This is not an error, just update state
+        videoRecordingState.isRecording = false;
+        videoRecordingState.overlayState = 'stopped';
+        videoRecordingState.stopTime = new Date();
+        await updateOverlayState(currentTab.page, 'stopped');
+
+        videoPath = videoRecordingState.videoPath || null;
+        message = `Recording stopped (was already stopped or timed out). Video path: ${videoPath || 'not available'}`;
+      }
+    }
+
+    const currentState = videoRecordingState.overlayState;
+
+    const code = [
+      `// Execute recording control action: ${action}`,
+      `const action = '${action}';`,
+      `const previousState = '${previousState}';`,
+      `const currentState = '${currentState}';`,
+      videoPath ? `// Video saved to: ${videoPath}` : ''
+    ].filter(Boolean);
+
+    return {
+      code,
+      captureSnapshot: false,
+      waitForNetwork: false,
+      resultOverride: {
+        content: [{
+          type: 'text' as const,
+          text: [
+            `Recording control action executed:`,
+            ``,
+            `Action: ${action}`,
+            `Previous state: ${previousState}`,
+            `Current state: ${currentState}`,
+            videoPath ? `Video path: ${videoPath}` : '',
+            duration !== null ? `Duration: ${duration.toFixed(2)} seconds` : '',
+            ``,
+            message
+          ].filter(Boolean).join('\n')
+        }]
+      }
+    };
+  }
+});
+
+// T034: Browser video status tool (consolidated from overlay_status + get_status)
+const videoStatusSchema = z.object({});
+
+const videoStatus = defineTool({
+  capability: 'video',
+  schema: {
+    name: 'browser_video_status',
+    title: 'Get video recording status',
+    description: `Query current video recording state, overlay status, duration, and video file path. Returns comprehensive status for LLMs to verify recording state before control actions.
+
+**Returns:**
+- Overlay enabled/position/session ID
+- Recording state (idle/recording/stopped)
+- Elapsed time and timestamps
+- Video path (after recording stops)
+- Video metadata (format, resolution, file size)
+
+**Recording Specs:**
+- Format: WebM (VP8)
+- Resolution: ${DEFAULT_VIDEO_SIZE.width}x${DEFAULT_VIDEO_SIZE.height}
+- FPS: ~25 fps (Playwright native)
+
+**Use browser_video_convert after recording to:**
+- Convert to MP4 for universal compatibility
+- Adjust FPS: 15 fps (default) or 30 fps (smooth animations)`,
+    inputSchema: videoStatusSchema,
+    type: 'readOnly',
+  },
+
+  handle: async context => {
+    // T038: Error handling for CONTEXT_CLOSED
+    try {
+      await context.ensureTab();
+    } catch (error) {
+      throw new Error('CONTEXT_CLOSED: Browser context is closed, cannot query status. Create new browser context before querying status.');
+    }
+
+    // T035: Calculate elapsed time
+    let elapsedTime = 0;
+    if (videoRecordingState.startTime) {
+      const endTime = videoRecordingState.stopTime || new Date();
+      elapsedTime = (endTime.getTime() - videoRecordingState.startTime.getTime()) / 1000;
+    }
+
+    // T036: Video metadata extraction (available after stop)
+    let videoMetadata: {
+      format: string;
+      duration: number;
+      resolution: { width: number; height: number };
+      fileSize: number;
+    } | null = null;
+
+    if (videoRecordingState.overlayState === 'stopped' && videoRecordingState.videoPath) {
+      try {
+        const stats = await fs.promises.stat(videoRecordingState.videoPath);
+        videoMetadata = {
+          format: 'webm',
+          duration: elapsedTime,
+          resolution: DEFAULT_VIDEO_SIZE,
+          fileSize: stats.size
+        };
+      } catch (error) {
+        // File may not exist yet, this is non-fatal
+        const debugError = debug('pw:mcp:overlay');
+        debugError('Failed to get video file stats:', error);
+      }
+    }
+
+    const status = {
+      overlayEnabled: videoRecordingState.overlayEnabled,
+      overlayPosition: videoRecordingState.overlayEnabled ? videoRecordingState.overlayPosition : null,
+      sessionId: videoRecordingState.sessionId,
+      state: videoRecordingState.overlayState,
+      elapsedTime,
+      startTime: videoRecordingState.startTime?.toISOString() || null,
+      stopTime: videoRecordingState.stopTime?.toISOString() || null,
+      videoPath: videoRecordingState.overlayState === 'stopped' ? videoRecordingState.videoPath : null,
+      videoMetadata
     };
 
     const code = [
-      `// Configure enhanced cursor tracking`,
-      `const cursorSettings = ${JSON.stringify(settings, null, 2)};`,
-      params.enabled ? `// Cursor tracking enabled with enhanced visibility` : `// Cursor tracking disabled`
+      `// Query recording overlay status`,
+      `const status = ${JSON.stringify(status, null, 2)};`
     ];
 
     return {
@@ -530,7 +993,19 @@ const videoAddCursorTracking = defineTool({
       resultOverride: {
         content: [{
           type: 'text' as const,
-          text: `Cursor tracking ${params.enabled ? 'enabled' : 'disabled'}:\nClick animations: ${settings.clickAnimation}\nCursor size: ${settings.cursorSize}x\nClick color: ${settings.clickColor}\nTrail length: ${settings.trailLength}px\n\nNote: Enhanced cursor effects require additional browser configuration or post-processing.`
+          text: [
+            `Video Recording Status:`,
+            ``,
+            `Overlay Enabled: ${status.overlayEnabled}`,
+            status.overlayEnabled ? `Position: ${status.overlayPosition}` : '',
+            status.overlayEnabled ? `Session ID: ${status.sessionId}` : '',
+            `State: ${status.state}`,
+            status.elapsedTime > 0 ? `Elapsed Time: ${status.elapsedTime.toFixed(2)} seconds` : '',
+            status.startTime ? `Start Time: ${status.startTime}` : '',
+            status.stopTime ? `Stop Time: ${status.stopTime}` : '',
+            status.videoPath ? `Video Path: ${status.videoPath}` : '',
+            status.videoMetadata ? `Video Size: ${(status.videoMetadata.fileSize / 1024).toFixed(1)} KB` : ''
+          ].filter(Boolean).join('\n')
         }]
       }
     };
@@ -538,13 +1013,11 @@ const videoAddCursorTracking = defineTool({
 });
 
 export default [
-  videoStart,
-  videoStop,
-  videoGetStatus,
-  videoConfigure,
+  // Core recording tools (overlay-based)
+  videoOverlayEnable,
+  videoOverlayControl,
+  videoStatus,
+  // Post-processing tools
   videoConvert,
   videoSave,
-  videoAddAnnotation,
-  videoAddHighlight,
-  videoAddCursorTracking,
 ];

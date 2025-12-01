@@ -572,6 +572,34 @@ X Y coordinate space, based on the provided screenshot.
 
 <!-- NOTE: This has been generated via update-readme.js -->
 
+- **browser_screen_capture_desktop**
+  - Title: Capture desktop screenshot
+  - Description: Capture the entire computer screen (not just browser viewport) with an optional delay timer and audio feedback.
+
+**Use Cases:**
+- See how the Playwright browser initially opens
+- Capture mobile device emulation with full browser chrome
+- Debug display/rendering issues
+- Verify browser window size and positioning
+
+**Features:**
+- Configurable delay (default: 5 seconds)
+- Audio feedback when screenshot is captured (default: enabled)
+- Cross-platform support (Linux, macOS, Windows, WSL)
+
+**Requirements by OS:**
+- Linux: Requires 'scrot' or 'import' (ImageMagick) to be installed
+- macOS: Uses built-in 'screencapture' command
+- Windows: Uses PowerShell screenshot capability
+- WSL: Uses PowerShell through Windows interop
+  - Parameters:
+    - `delay` (number, optional): Delay in seconds before taking screenshot. Default: 5 seconds. Useful for waiting for browser to fully render.
+    - `filename` (string, optional): File name to save the screenshot to. Defaults to `desktop-{timestamp}.png` if not specified.
+    - `sound` (boolean, optional): Play a shutter sound when screenshot is captured. Default: true. Provides audio feedback that screenshot was taken.
+  - Read-only: **true**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
 - **browser_pdf_save**
   - Title: Save as PDF
   - Description: Save page as PDF
@@ -681,6 +709,131 @@ X Y coordinate space, based on the provided screenshot.
     - `description` (string): The description of the test
     - `steps` (array): The steps of the test
   - Read-only: **true**
+
+</details>
+
+<details>
+<summary><b>Video Recording</b></summary>
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
+- **browser_video_overlay_enable**
+  - Title: Enable recording overlay controls
+  - Description: Enable recording overlay controls for current browser session. Shows record/pause/stop buttons that can be triggered via MCP tools. Overlay persists across page navigations and provides visual feedback of recording state to users and LLMs.
+
+**Recording Specifications:**
+- Format: WebM (VP8 codec) - native Playwright format
+- Resolution: 800x600 pixels
+- FPS: ~25 fps (Playwright native capture rate)
+- Compatible with: Google Gemini, most video platforms
+
+**Workflow:**
+1. Call browser_video_overlay_enable to activate overlay
+2. Use autoStart=true for immediate recording, or control manually
+3. Use browser_video_overlay_control for pause/resume/stop
+4. Check browser_video_status for recording info and video path
+5. Optional: Use browser_video_convert to change format/FPS
+
+**Note:** Use browser_video_convert to adjust FPS (15 fps default, 30 fps for smooth animations) after recording.
+  - Parameters:
+    - `position` (string, optional): Overlay position on browser window. Default 'top-right' minimizes interference with page content and browser UI.
+    - `autoStart` (boolean, optional): Automatically start recording when overlay is enabled. If true, recording begins immediately without requiring explicit browser_video_overlay_control call.
+  - Read-only: **false**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
+- **browser_video_overlay_control**
+  - Title: Control recording via overlay
+  - Description: Control recording via overlay buttons (record/pause/resume/stop). Triggers recording state changes and updates overlay visual state.
+
+**Actions:**
+- 'record': Start new recording (from idle state)
+- 'pause': Stop current recording and save video (Playwright limitation: true pause not supported)
+- 'resume': Start new recording (creates new video file)
+- 'stop': Finalize recording and save video
+
+**State Machine:**
+- idle → recording (on 'record')
+- recording → stopped (on 'pause' or 'stop')
+- stopped → recording (on 'resume' - new video file)
+
+**Important:** Each pause/resume cycle creates a new video file. Use browser_video_status to get the video path after stopping.
+  - Parameters:
+    - `action` (string): Recording control action to execute. 'record' starts recording, 'pause' stops current recording, 'resume' starts new recording, 'stop' finalizes and saves video.
+  - Read-only: **false**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
+- **browser_video_status**
+  - Title: Get video recording status
+  - Description: Query current video recording state, overlay status, duration, and video file path. Returns comprehensive status for LLMs to verify recording state before control actions.
+
+**Returns:**
+- Overlay enabled/position/session ID
+- Recording state (idle/recording/stopped)
+- Elapsed time and timestamps
+- Video path (after recording stops)
+- Video metadata (format, resolution, file size)
+
+**Recording Specs:**
+- Format: WebM (VP8)
+- Resolution: 800x600
+- FPS: ~25 fps (Playwright native)
+
+**Use browser_video_convert after recording to:**
+- Convert to MP4 for universal compatibility
+- Adjust FPS: 15 fps (default) or 30 fps (smooth animations)
+  - Parameters: None
+  - Read-only: **true**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
+- **browser_video_convert**
+  - Title: Convert video format
+  - Description: Convert video files between different formats (MP4, WebM, GIF). Requires FFmpeg to be installed.
+
+**FPS Control:**
+- Default: 15 fps - Efficient for automation demos and most use cases
+- Smooth: 30 fps - Better for animations, transitions, and rapid visual changes
+- Custom: 1-60 fps range supported via 'fps' parameter
+
+**Recommended Workflow:**
+1. Record with browser_video_overlay_enable (Playwright captures at native ~25 fps)
+2. Convert with browser_video_convert to optimize FPS and format
+3. Use 'smooth: true' only when recording animations or transitions
+
+**Format Notes:**
+- WebM: Native Playwright format, good quality, may need conversion for some platforms
+- MP4: Universal compatibility, recommended for sharing (Google Gemini, social media)
+- GIF: For short clips only, no audio, larger file sizes
+  - Parameters:
+    - `inputPath` (string): Path to the source video file
+    - `outputPath` (string): Path for the converted video file
+    - `format` (string): Target format for conversion
+    - `quality` (string, optional): Quality preset for conversion
+    - `fps` (number, optional): Output frame rate. Default: 15 fps (efficient for automation demos). Use 30 fps for content with animations or transitions.
+    - `smooth` (boolean, optional): When true, uses 30 fps for smoother animation playback. When false or omitted, uses 15 fps for smaller file size. Overrides 'fps' parameter if set.
+  - Read-only: **false**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
+- **browser_video_save**
+  - Title: Save video recording
+  - Description: Save current or completed video recording to a specific location with custom naming.
+
+**Usage:**
+1. Record video using browser_video_overlay_enable/control
+2. Stop recording to finalize the video
+3. Call browser_video_save to copy to custom location
+
+**Notes:**
+- Native format is WebM (VP8 codec)
+- Use browser_video_convert for MP4 or to adjust FPS
+- Video specs: 800x600, ~25 fps
+  - Parameters:
+    - `filename` (string): Filename for the saved video
+    - `format` (string, optional): Video format (webm is native Playwright format)
+  - Read-only: **false**
 
 </details>
 

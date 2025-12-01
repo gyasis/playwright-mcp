@@ -16,11 +16,14 @@
 
 import debug from 'debug';
 import * as playwright from 'playwright';
+import { devices } from 'playwright';
 
 import { callOnPageNoTrace, waitForCompletion } from './tools/utils.js';
 import { ManualPromise } from './manualPromise.js';
 import { Tab } from './tab.js';
 import { outputFile } from './config.js';
+import { generateOverlayHTML } from './tools/overlay-template.js';
+import type { OverlayPosition } from './config.js';
 
 import type { ImageContent, TextContent } from '@modelcontextprotocol/sdk/types.js';
 import type { ModalState, Tool, ToolActionResult } from './tools/tool.js';
@@ -43,6 +46,8 @@ export class Context {
   private _modalStates: (ModalState & { tab: Tab })[] = [];
   private _pendingAction: PendingAction | undefined;
   private _downloads: { download: playwright.Download, finished: boolean, outputFile: string }[] = [];
+  private _videoRecordingEnabled: boolean = false;
+  private _videoRecordingOptions: playwright.BrowserContextOptions['recordVideo'] | undefined;
   clientVersion: { name: string; version: string; } | undefined;
 
   constructor(tools: Tool[], config: FullConfig, browserContextFactory: BrowserContextFactory) {
@@ -290,6 +295,152 @@ ${code.join('\n')}
       void this.close();
   }
 
+  async switchDevice(deviceName: string): Promise<void> {
+    testDebug(`switching device to: ${deviceName}`);
+
+    // Validate device name
+    const deviceConfig = this._getDeviceConfig(deviceName);
+    if (!deviceConfig)
+      throw new Error(`Unknown device: ${deviceName}. Use "desktop" or a device from playwright.devices like "iPhone 15", "Pixel 7", etc.`);
+
+    // Save current tab URLs to restore after context recreation
+    const currentTabUrls: string[] = [];
+    if (this._tabs.length > 0) {
+      for (const tab of this._tabs) {
+        const url = tab.page.url();
+        if (url && url !== 'about:blank')
+          currentTabUrls.push(url);
+      }
+    }
+
+    // Close current browser context
+    await this.close();
+
+    // Update config with new device settings
+    if (deviceName === 'desktop') {
+      // Reset to desktop settings
+      this.config.browser.contextOptions = {
+        ...this.config.browser.contextOptions,
+        viewport: null,
+        userAgent: undefined,
+        deviceScaleFactor: undefined,
+        hasTouch: undefined,
+        isMobile: undefined,
+      };
+    } else {
+      // Apply device emulation settings
+      this.config.browser.contextOptions = {
+        ...this.config.browser.contextOptions,
+        ...deviceConfig,
+      };
+    }
+
+    // Recreate browser context with new device settings
+    const { browserContext } = await this._ensureBrowserContext();
+
+    // Restore tabs with saved URLs
+    if (currentTabUrls.length > 0) {
+      for (const url of currentTabUrls) {
+        const page = await browserContext.newPage();
+        await page.goto(url);
+      }
+    } else {
+      // Create at least one empty tab if no URLs to restore
+      await browserContext.newPage();
+    }
+
+    // Resize browser window using CDP for proper mobile/desktop visualization
+    if (!this.config.browser.launchOptions?.headless) {
+      try {
+        const pages = browserContext.pages();
+        if (pages.length > 0) {
+          const page = pages[0];
+
+          // Calculate window dimensions
+          let windowWidth: number;
+          let windowHeight: number;
+
+          if (deviceName === 'desktop') {
+            // For desktop, use a large comfortable size
+            windowWidth = 1280;
+            windowHeight = 800;
+          } else if (deviceConfig.viewport) {
+            // For mobile devices, use device viewport + padding for browser chrome
+            const targetViewport = deviceConfig.viewport;
+            // Add padding for browser chrome (title bar ~80px, borders ~20px)
+            windowWidth = targetViewport.width + 20;
+            windowHeight = targetViewport.height + 100;
+          } else {
+            // Fallback
+            windowWidth = 1280;
+            windowHeight = 800;
+          }
+
+          // Use CDP to resize the actual browser window
+          const client = await page.context().newCDPSession(page);
+          try {
+            // Get the window ID for this target
+            const { windowId } = await client.send('Browser.getWindowForTarget');
+
+            // Set window bounds - first set to 'normal' state, then resize
+            await client.send('Browser.setWindowBounds', {
+              windowId,
+              bounds: {
+                windowState: 'normal',
+              },
+            });
+
+            // Now set the actual size
+            await client.send('Browser.setWindowBounds', {
+              windowId,
+              bounds: {
+                width: windowWidth,
+                height: windowHeight,
+              },
+            });
+
+            testDebug(`Resized browser window to ${windowWidth}x${windowHeight} for device ${deviceName}`);
+          } finally {
+            await client.detach();
+          }
+        }
+      } catch (error) {
+        testDebug(`Could not resize browser window: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    testDebug(`device switched to: ${deviceName}`);
+  }
+
+  private _getDeviceConfig(deviceName: string): playwright.BrowserContextOptions | null {
+    if (deviceName === 'desktop')
+      return {}; // Desktop is handled specially
+
+    // Check if it's a known Playwright device
+    if (deviceName in devices)
+      return devices[deviceName as keyof typeof devices];
+
+    // Check for common device aliases
+    const deviceAliases: Record<string, string> = {
+      'iphone': 'iPhone 13',
+      'iphone15': 'iPhone 15',
+      'iphone14': 'iPhone 14',
+      'iphone13': 'iPhone 13',
+      'pixel': 'Pixel 7',
+      'pixel7': 'Pixel 7',
+      'pixel6': 'Pixel 6',
+      'ipad': 'iPad Pro',
+      'android': 'Pixel 7',
+      'mobile': 'iPhone 13',
+    };
+
+    const aliasDevice = deviceAliases[deviceName.toLowerCase()];
+    if (aliasDevice && aliasDevice in devices)
+      return devices[aliasDevice as keyof typeof devices];
+
+    return null;
+  }
+
   async close() {
     if (!this._browserContextPromise)
       return;
@@ -332,7 +483,23 @@ ${code.join('\n')}
 
   private async _setupBrowserContext(): Promise<{ browserContext: playwright.BrowserContext, close: () => Promise<void> }> {
     // TODO: move to the browser context factory to make it based on isolation mode.
+
+    // Temporarily modify context options if video recording is enabled
+    const originalContextOptions = this.config.browser.contextOptions;
+    if (this._videoRecordingEnabled && this._videoRecordingOptions) {
+      this.config.browser.contextOptions = {
+        ...originalContextOptions,
+        recordVideo: this._videoRecordingOptions
+      };
+    }
+
     const result = await this._browserContextFactory.createContext();
+
+    // Restore original context options
+    if (this._videoRecordingEnabled && this._videoRecordingOptions)
+      this.config.browser.contextOptions = originalContextOptions;
+
+
     const { browserContext } = result;
     await this._setupRequestInterception(browserContext);
     for (const page of browserContext.pages())
@@ -347,5 +514,120 @@ ${code.join('\n')}
       });
     }
     return result;
+  }
+
+  async closeBrowserContext(): Promise<void> {
+    if (this._browserContextPromise) {
+      const { close } = await this._browserContextPromise;
+      await close();
+      this._browserContextPromise = undefined;
+      this._currentTab = undefined;
+      this._tabs = [];
+    }
+  }
+
+  async startVideoRecording(recordVideoOptions: playwright.BrowserContextOptions['recordVideo']): Promise<void> {
+    if (this._videoRecordingEnabled)
+      throw new Error('Video recording is already enabled.');
+
+    // Save current page URLs before closing context
+    const currentUrls: string[] = [];
+    for (const tab of this._tabs) {
+      const url = tab.page.url();
+      if (url && url !== 'about:blank')
+        currentUrls.push(url);
+    }
+
+    // Store the video recording options
+    this._videoRecordingOptions = recordVideoOptions;
+    this._videoRecordingEnabled = true;
+
+    // Close existing browser context
+    await this.closeBrowserContext();
+
+    // Immediately recreate browser context with video recording enabled
+    const { browserContext } = await this._ensureBrowserContext();
+
+    // Restore tabs with saved URLs, or create an empty tab
+    if (currentUrls.length > 0) {
+      for (const url of currentUrls) {
+        const page = await browserContext.newPage();
+        await page.goto(url);
+      }
+    } else {
+      await browserContext.newPage();
+    }
+
+    testDebug('Video recording started, browser context recreated');
+  }
+
+  async stopVideoRecording(): Promise<string | undefined> {
+    if (!this._videoRecordingEnabled)
+      throw new Error('Video recording is not enabled.');
+
+
+    let videoPath: string | undefined;
+
+    if (this._browserContextPromise) {
+      const { browserContext } = await this._browserContextPromise;
+
+      // Get video path from one of the pages (if any exist)
+      const pages = browserContext.pages();
+      if (pages.length > 0) {
+        const video = pages[0].video();
+        if (video)
+          videoPath = await video.path();
+
+      }
+
+      // Close the context to finalize video recording
+      await this.closeBrowserContext();
+    }
+
+    // Reset video recording state
+    this._videoRecordingEnabled = false;
+    this._videoRecordingOptions = undefined;
+
+    // Wait a bit for the video file to be written
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    return videoPath;
+  }
+
+  isVideoRecordingEnabled(): boolean {
+    return this._videoRecordingEnabled;
+  }
+
+  /**
+   * Inject recording overlay into a page using addInitScript
+   *
+   * This method implements the overlay injection strategy from research.md:
+   * - Uses page.addInitScript() for persistence across navigations
+   * - Overlay HTML/CSS is injected before page content loads
+   * - Works in both headed and headless modes (DOM exists in headless)
+   *
+   * @param page - Page to inject overlay into
+   * @param position - Corner position for overlay (default: 'top-right')
+   * @param sessionId - Unique session identifier
+   */
+  async injectRecordingOverlay(
+    page: playwright.Page,
+    position: OverlayPosition = 'top-right',
+    sessionId: string
+  ): Promise<void> {
+    const overlayScript = generateOverlayHTML(position, sessionId);
+
+    // Use addInitScript for persistence across navigations (per research.md decision)
+    await page.addInitScript(overlayScript);
+
+    // If page is already loaded, also execute now to show overlay immediately
+    if (page.url() !== 'about:blank') {
+      try {
+        await page.evaluate(overlayScript);
+      } catch (error) {
+        // Ignore errors if page is not ready yet - addInitScript will handle it
+        testDebug('Failed to inject overlay immediately, will be injected on next load:', error);
+      }
+    }
   }
 }

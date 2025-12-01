@@ -23,12 +23,45 @@ import type { Config as PublicConfig, ToolCapability } from '../config.js';
 import type { BrowserContextOptions, LaunchOptions } from 'playwright';
 import { sanitizeForFilePath } from './tools/utils.js';
 
+/**
+ * Overlay position for recording controls
+ */
+export type OverlayPosition = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+
+/**
+ * Overlay configuration for video recording controls
+ */
+export type OverlayConfig = {
+  /**
+   * Whether overlay recording controls are enabled
+   */
+  enabled: boolean;
+
+  /**
+   * Position of overlay on the browser window
+   * @default 'top-right'
+   */
+  position: OverlayPosition;
+
+  /**
+   * Automatically start recording when overlay is enabled
+   * @default false
+   */
+  autoStart: boolean;
+};
+
 type Config = PublicConfig & {
   /**
    * TODO: Move to PublicConfig once we are ready to release this feature.
    * Run server that is able to connect to the 'Playwright MCP' Chrome extension.
    */
   extension?: boolean;
+
+  /**
+   * Overlay recording controls configuration (internal use)
+   * TODO: Move to PublicConfig when feature is stable
+   */
+  overlay?: Partial<OverlayConfig>;
 };
 
 export type CLIOptions = {
@@ -66,7 +99,10 @@ const defaultConfig: FullConfig = {
     browserName: 'chromium',
     launchOptions: {
       channel: 'chrome',
-      headless: os.platform() === 'linux' && !process.env.DISPLAY,
+      // Always default to headed mode for LLM use cases
+      // This ensures browser is visible for video recording and visual feedback
+      // Use --headless CLI flag to override if needed
+      headless: false,
       chromiumSandbox: true,
     },
     contextOptions: {

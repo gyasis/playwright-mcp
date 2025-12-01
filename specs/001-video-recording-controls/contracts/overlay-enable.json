@@ -1,0 +1,80 @@
+{
+  "name": "browser_video_overlay_enable",
+  "description": "Enable recording overlay controls for current browser session. Shows record/pause/stop buttons that can be triggered via MCP tools. Overlay persists across page navigations and provides visual feedback of recording state to users and LLMs.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "position": {
+        "type": "string",
+        "enum": ["top-left", "top-right", "bottom-left", "bottom-right"],
+        "default": "top-right",
+        "description": "Overlay position on browser window. Default 'top-right' minimizes interference with page content and browser UI."
+      },
+      "autoStart": {
+        "type": "boolean",
+        "default": false,
+        "description": "Automatically start recording when overlay is enabled. If true, recording begins immediately without requiring explicit browser_video_overlay_control call."
+      }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "Whether overlay was successfully enabled"
+      },
+      "sessionId": {
+        "type": "string",
+        "description": "Unique identifier for this recording session (UUID)"
+      },
+      "overlayPosition": {
+        "type": "string",
+        "description": "Confirmed overlay position"
+      },
+      "recordingStarted": {
+        "type": "boolean",
+        "description": "Whether recording auto-started (only true if autoStart was true)"
+      }
+    }
+  },
+  "capability": "video",
+  "classification": "destructive",
+  "examples": [
+    {
+      "description": "Enable overlay in default position",
+      "input": {},
+      "expectedOutput": {
+        "success": true,
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "overlayPosition": "top-right",
+        "recordingStarted": false
+      }
+    },
+    {
+      "description": "Enable overlay with auto-start in bottom-left",
+      "input": {
+        "position": "bottom-left",
+        "autoStart": true
+      },
+      "expectedOutput": {
+        "success": true,
+        "sessionId": "660e8400-e29b-41d4-a716-446655440001",
+        "overlayPosition": "bottom-left",
+        "recordingStarted": true
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": "OVERLAY_ALREADY_ENABLED",
+      "message": "Recording overlay is already enabled for this session",
+      "recovery": "Call browser_video_overlay_control to manage existing overlay, or close browser context and create new session"
+    },
+    {
+      "code": "CONTEXT_CLOSED",
+      "message": "Browser context is closed, cannot enable overlay",
+      "recovery": "Create new browser context before enabling overlay"
+    }
+  ]
+}

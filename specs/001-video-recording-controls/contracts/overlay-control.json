@@ -1,0 +1,154 @@
+{
+  "name": "browser_video_overlay_control",
+  "description": "Control recording via overlay buttons (record/pause/resume/stop). Triggers recording state changes and updates overlay visual state. Note: 'pause' stops current recording per Playwright limitations - 'resume' starts new recording (new video file).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["record", "pause", "resume", "stop"],
+        "description": "Recording control action to execute. 'record' starts recording, 'pause' stops current recording, 'resume' starts new recording, 'stop' finalizes and saves video."
+      }
+    },
+    "required": ["action"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "Whether action was successfully executed"
+      },
+      "previousState": {
+        "type": "string",
+        "enum": ["idle", "recording", "stopped"],
+        "description": "Recording state before this action"
+      },
+      "currentState": {
+        "type": "string",
+        "enum": ["idle", "recording", "stopped"],
+        "description": "Recording state after this action"
+      },
+      "videoPath": {
+        "type": "string",
+        "description": "Absolute path to video file (only present when action is 'stop')",
+        "nullable": true
+      },
+      "duration": {
+        "type": "number",
+        "description": "Recording duration in seconds (only present when action is 'stop')",
+        "nullable": true
+      },
+      "message": {
+        "type": "string",
+        "description": "Human-readable action result message"
+      }
+    }
+  },
+  "capability": "video",
+  "classification": "destructive",
+  "examples": [
+    {
+      "description": "Start recording",
+      "input": {
+        "action": "record"
+      },
+      "expectedOutput": {
+        "success": true,
+        "previousState": "idle",
+        "currentState": "recording",
+        "videoPath": null,
+        "duration": null,
+        "message": "Recording started successfully"
+      }
+    },
+    {
+      "description": "Stop recording",
+      "input": {
+        "action": "stop"
+      },
+      "expectedOutput": {
+        "success": true,
+        "previousState": "recording",
+        "currentState": "stopped",
+        "videoPath": "/output/recording-2025-11-29T10-30-00.webm",
+        "duration": 45.3,
+        "message": "Recording stopped. Video saved to /output/recording-2025-11-29T10-30-00.webm"
+      }
+    },
+    {
+      "description": "Pause recording (stops current, allows resume with new file)",
+      "input": {
+        "action": "pause"
+      },
+      "expectedOutput": {
+        "success": true,
+        "previousState": "recording",
+        "currentState": "stopped",
+        "videoPath": "/output/recording-2025-11-29T10-30-00.webm",
+        "duration": 22.1,
+        "message": "Recording paused (stopped). Resume will start new recording."
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": "INVALID_STATE_TRANSITION",
+      "message": "Cannot perform action '{action}' in current state '{currentState}'",
+      "recovery": "Check current state with browser_video_overlay_status before attempting action"
+    },
+    {
+      "code": "OVERLAY_NOT_ENABLED",
+      "message": "Recording overlay is not enabled",
+      "recovery": "Call browser_video_overlay_enable before attempting to control recording"
+    },
+    {
+      "code": "RECORDING_ALREADY_ACTIVE",
+      "message": "Recording is already in progress",
+      "recovery": "Stop current recording before starting new one"
+    },
+    {
+      "code": "NO_ACTIVE_RECORDING",
+      "message": "No active recording to stop/pause",
+      "recovery": "Start recording first with action 'record'"
+    }
+  ],
+  "stateTransitions": {
+    "description": "Valid state transitions for recording control",
+    "transitions": [
+      {
+        "from": "idle",
+        "to": "recording",
+        "action": "record",
+        "valid": true
+      },
+      {
+        "from": "recording",
+        "to": "stopped",
+        "action": "stop",
+        "valid": true
+      },
+      {
+        "from": "recording",
+        "to": "stopped",
+        "action": "pause",
+        "valid": true,
+        "note": "Pause stops current recording (Playwright limitation)"
+      },
+      {
+        "from": "stopped",
+        "to": "recording",
+        "action": "resume",
+        "valid": true,
+        "note": "Resume starts NEW recording (new video file)"
+      },
+      {
+        "from": "idle",
+        "to": "stopped",
+        "action": "stop",
+        "valid": false,
+        "error": "INVALID_STATE_TRANSITION"
+      }
+    ]
+  }
+}

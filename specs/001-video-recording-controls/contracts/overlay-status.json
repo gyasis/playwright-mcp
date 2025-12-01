@@ -1,0 +1,161 @@
+{
+  "name": "browser_video_overlay_status",
+  "description": "Query current recording state and overlay status. Returns recording duration, state, and video file path if stopped. Useful for LLMs to verify recording state before attempting control actions.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "overlayEnabled": {
+        "type": "boolean",
+        "description": "Whether recording overlay is currently enabled"
+      },
+      "overlayPosition": {
+        "type": "string",
+        "enum": ["top-left", "top-right", "bottom-left", "bottom-right"],
+        "description": "Current overlay position on screen"
+      },
+      "sessionId": {
+        "type": "string",
+        "description": "Current recording session ID (UUID)"
+      },
+      "state": {
+        "type": "string",
+        "enum": ["idle", "recording", "stopped"],
+        "description": "Current recording state"
+      },
+      "elapsedTime": {
+        "type": "number",
+        "description": "Elapsed recording time in seconds (0 if not recording)",
+        "nullable": true
+      },
+      "startTime": {
+        "type": "string",
+        "description": "ISO 8601 timestamp when recording started (null if not started)",
+        "format": "date-time",
+        "nullable": true
+      },
+      "stopTime": {
+        "type": "string",
+        "description": "ISO 8601 timestamp when recording stopped (null if not stopped)",
+        "format": "date-time",
+        "nullable": true
+      },
+      "videoPath": {
+        "type": "string",
+        "description": "Absolute path to video file (null if not stopped)",
+        "nullable": true
+      },
+      "videoMetadata": {
+        "type": "object",
+        "description": "Video file metadata (only present when state is 'stopped')",
+        "nullable": true,
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": ["webm", "mp4"]
+          },
+          "duration": {
+            "type": "number",
+            "description": "Video duration in seconds"
+          },
+          "resolution": {
+            "type": "object",
+            "properties": {
+              "width": {
+                "type": "integer"
+              },
+              "height": {
+                "type": "integer"
+              }
+            }
+          },
+          "fileSize": {
+            "type": "integer",
+            "description": "File size in bytes"
+          }
+        }
+      }
+    }
+  },
+  "capability": "video",
+  "classification": "readOnly",
+  "examples": [
+    {
+      "description": "Status when overlay not enabled",
+      "input": {},
+      "expectedOutput": {
+        "overlayEnabled": false,
+        "overlayPosition": null,
+        "sessionId": null,
+        "state": "idle",
+        "elapsedTime": 0,
+        "startTime": null,
+        "stopTime": null,
+        "videoPath": null,
+        "videoMetadata": null
+      }
+    },
+    {
+      "description": "Status during active recording",
+      "input": {},
+      "expectedOutput": {
+        "overlayEnabled": true,
+        "overlayPosition": "top-right",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "state": "recording",
+        "elapsedTime": 12.5,
+        "startTime": "2025-11-29T10:30:00.000Z",
+        "stopTime": null,
+        "videoPath": null,
+        "videoMetadata": null
+      }
+    },
+    {
+      "description": "Status after recording stopped",
+      "input": {},
+      "expectedOutput": {
+        "overlayEnabled": true,
+        "overlayPosition": "top-right",
+        "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+        "state": "stopped",
+        "elapsedTime": 45.3,
+        "startTime": "2025-11-29T10:30:00.000Z",
+        "stopTime": "2025-11-29T10:30:45.300Z",
+        "videoPath": "/output/recording-2025-11-29T10-30-00.webm",
+        "videoMetadata": {
+          "format": "webm",
+          "duration": 45.3,
+          "resolution": {
+            "width": 1280,
+            "height": 720
+          },
+          "fileSize": 2457600
+        }
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": "CONTEXT_CLOSED",
+      "message": "Browser context is closed, cannot query status",
+      "recovery": "Create new browser context before querying status"
+    }
+  ],
+  "useCases": [
+    {
+      "scenario": "LLM verifies recording is active before performing automation",
+      "rationale": "Prevents errors from attempting actions that expect recording to be active"
+    },
+    {
+      "scenario": "User checks how long recording has been running",
+      "rationale": "Helps manage disk space and avoid exceeding target recording duration"
+    },
+    {
+      "scenario": "LLM retrieves video path after stopping to include in response",
+      "rationale": "Provides video file location to user for immediate access to recorded automation"
+    }
+  ]
+}

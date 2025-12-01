@@ -6,3 +6,23 @@ playwright-report/
 
 .idea
 .DS_Store
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Build artifacts
+dist/
+build/
+
+# Temporary files
+*.tmp
+*.swp
