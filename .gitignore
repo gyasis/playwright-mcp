@@ -26,3 +26,10 @@ build/
 # Temporary files
 *.tmp
 *.swp
+
+# Personal/local development files (not shared)
+.specstory/
+.specify/
+.cursorindexingignore
+prd/
+.claude/commands/
